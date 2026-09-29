@@ -149,6 +149,23 @@ impl Capturer {
         }
     }
 
+    /// Non-blocking drain step: returns the next queued video frame if one is
+    /// ready, `Ok(None)` when the queue is empty, and `Err(RecvError)` when the
+    /// producer has disconnected (same disconnect semantics as `get_next_frame`).
+    pub fn try_next_frame(&self) -> Result<Option<Frame>, mpsc::RecvError> {
+        loop {
+            match self.rx.try_recv() {
+                Ok(item) => {
+                    if let Some(frame) = self.engine.process_channel_item(item) {
+                        return Ok(Some(frame));
+                    }
+                }
+                Err(mpsc::TryRecvError::Empty) => return Ok(None),
+                Err(mpsc::TryRecvError::Disconnected) => return Err(mpsc::RecvError),
+            }
+        }
+    }
+
     /// Get the dimensions the frames will be captured in
     pub fn get_output_frame_size(&mut self) -> [u32; 2] {
         self.engine.get_output_frame_size()

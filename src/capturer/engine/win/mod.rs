@@ -3,7 +3,7 @@ use crate::{
     frame::{AudioFormat, AudioFrame, BGRAFrame, Frame, FrameType, VideoFrame},
     targets::{self, Target},
 };
-use ::windows::Win32::System::Performance::{QueryPerformanceCounter, QueryPerformanceFrequency};
+use std::time::Instant;
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -24,8 +24,7 @@ use windows_capture::{
 struct Capturer {
     pub tx: mpsc::Sender<Frame>,
     pub crop: Option<Area>,
-    pub start_time: (i64, SystemTime),
-    pub perf_freq: i64,
+    pub start_time: (Instant, SystemTime),
 }
 
 #[derive(Clone)]
@@ -48,19 +47,7 @@ impl GraphicsCaptureApiHandler for Capturer {
         Ok(Self {
             tx: context.flags.tx,
             crop: context.flags.crop,
-            start_time: (
-                unsafe {
-                    let mut time = 0;
-                    let _ = QueryPerformanceCounter(&mut time);
-                    time
-                },
-                SystemTime::now(),
-            ),
-            perf_freq: unsafe {
-                let mut freq = 0;
-                let _ = QueryPerformanceFrequency(&mut freq);
-                freq
-            },
+            start_time: (Instant::now(), SystemTime::now()),
         })
     }
 
@@ -69,13 +56,12 @@ impl GraphicsCaptureApiHandler for Capturer {
         frame: &mut WCFrame,
         _: InternalCaptureControl,
     ) -> Result<(), Self::Error> {
-        let elapsed = frame.timestamp()?.Duration - self.start_time.0;
+        // Wall-clock display time from the steady clock: elapsed since
+        // session start, no QPC needed (`windows` crate gone).
         let display_time = self
             .start_time
             .1
-            .checked_add(Duration::from_secs_f64(
-                elapsed as f64 / self.perf_freq as f64,
-            ))
+            .checked_add(self.start_time.0.elapsed())
             .unwrap();
 
         match &self.crop {
@@ -176,6 +162,16 @@ pub enum CreateCapturerError {
     BuildAudioStream(cpal::Error),
 }
 
+/// Map `Options.fps` to the OS-side Graphics Capture throttle.
+/// fps >= 1 requests a custom minimum interval; fps == 0 leaves the default.
+fn minimum_update_interval(fps: u32) -> MinimumUpdateIntervalSettings {
+    if fps >= 1 {
+        MinimumUpdateIntervalSettings::Custom(Duration::from_secs_f32(1.0 / fps as f32))
+    } else {
+        MinimumUpdateIntervalSettings::Default
+    }
+}
+
 pub fn create_capturer(
     options: &Options,
     tx: mpsc::Sender<Frame>,
@@ -204,13 +200,15 @@ pub fn create_capturer(
         DrawBorderSettings::Default
     };
 
+    let minimum_update_interval = minimum_update_interval(options.fps);
+
     let settings = match target {
         Target::Display(display) => Settings::Display(WCSettings::new(
-            WCMonitor::from_raw_hmonitor(display.raw_handle.0),
+            WCMonitor::from_raw_hmonitor(display.raw_handle as *mut _),
             show_cursor,
             draw_border,
             SecondaryWindowSettings::Default,
-            MinimumUpdateIntervalSettings::Default,
+            minimum_update_interval,
             DirtyRegionSettings::Default,
             color_format,
             FlagStruct {
@@ -219,11 +217,11 @@ pub fn create_capturer(
             },
         )),
         Target::Window(window) => Settings::Window(WCSettings::new(
-            WCWindow::from_raw_hwnd(window.raw_handle.0),
+            WCWindow::from_raw_hwnd(window.raw_handle as *mut _),
             show_cursor,
             draw_border,
             SecondaryWindowSettings::Default,
-            MinimumUpdateIntervalSettings::Default,
+            minimum_update_interval,
             DirtyRegionSettings::Default,
             color_format,
             FlagStruct {

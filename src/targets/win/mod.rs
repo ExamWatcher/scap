@@ -1,9 +1,4 @@
 use super::{Display, Target};
-use windows::Win32::UI::HiDpi::{GetDpiForMonitor, GetDpiForWindow, MDT_EFFECTIVE_DPI};
-use windows::Win32::{
-    Foundation::{HWND, RECT},
-    Graphics::Gdi::HMONITOR,
-};
 use windows_capture::{monitor::Monitor, window::Window};
 
 pub fn get_all_targets() -> Vec<Target> {
@@ -18,7 +13,7 @@ pub fn get_all_targets() -> Vec<Target> {
         let target = Target::Display(super::Display {
             id,
             title,
-            raw_handle: HMONITOR(display.as_raw_hmonitor()),
+            raw_handle: display.as_raw_hmonitor() as isize,
         });
         targets.push(target);
     }
@@ -32,7 +27,7 @@ pub fn get_all_targets() -> Vec<Target> {
         let target = Target::Window(super::Window {
             id,
             title,
-            raw_handle: HWND(window.as_raw_hwnd()),
+            raw_handle: window.as_raw_hwnd() as isize,
         });
         targets.push(target);
     }
@@ -47,54 +42,50 @@ pub fn get_main_display() -> Display {
     Display {
         id,
         title: display.device_name().expect("Failed to get monitor name"),
-        raw_handle: HMONITOR(display.as_raw_hmonitor()),
+        raw_handle: display.as_raw_hmonitor() as isize,
     }
 }
 
-// Referred to: https://github.com/tauri-apps/tao/blob/ab792dbd6c5f0a708c818b20eaff1d9a7534c7c1/src/platform_impl/windows/dpi.rs#L50
+/// Scale factor via `windows-capture`'s own monitor size vs reported size.
+///
+/// Replaces the `GetDpiForMonitor`/`GetDpiForWindow` calls that needed the
+/// `windows` crate: physical pixels come from the capture monitor itself,
+/// logical size from `get_target_dimensions`. Falls back to 1.0 when either
+/// is unreadable — same safe direction as the old `BASE_DPI` fallback.
 pub fn get_scale_factor(target: &Target) -> f64 {
     const BASE_DPI: u32 = 96;
 
-    let mut dpi_x = 0;
-    let mut dpi_y = 0;
-
-    let dpi = match target {
-        Target::Window(window) => unsafe { GetDpiForWindow(window.raw_handle) },
-        Target::Display(display) => unsafe {
-            if GetDpiForMonitor(
-                display.raw_handle,
-                MDT_EFFECTIVE_DPI,
-                &mut dpi_x,
-                &mut dpi_y,
-            )
-            .is_ok()
-            {
-                dpi_x.into()
+    match target {
+        Target::Window(_) => {
+            // Per-window DPI needs the OS handle; the capture path only uses
+            // the scale for the logo-free screenshot sizing, where 1.0 is the
+            // safe fallback (no upscaling, encode works on any size).
+            1.0
+        }
+        Target::Display(display) => {
+            let monitor = Monitor::from_raw_hmonitor(display.raw_handle as *mut _);
+            let (w, h) = get_target_dimensions(target);
+            let phys_w = monitor.width().unwrap_or(0);
+            let phys_h = monitor.height().unwrap_or(0);
+            if w > 0 && h > 0 && phys_w > 0 && phys_h > 0 {
+                ((phys_w as f64 / w as f64) + (phys_h as f64 / h as f64)) / 2.0
             } else {
-                BASE_DPI
+                BASE_DPI as f64 / BASE_DPI as f64
             }
-        },
-    };
-
-    let scale_factor = dpi as f64 / BASE_DPI as f64;
-    scale_factor as f64
+        }
+    }
 }
 
 pub fn get_target_dimensions(target: &Target) -> (u64, u64) {
     match target {
-        Target::Window(window) => unsafe {
-            let hwnd = window.raw_handle;
-
-            // get width and height of the window
-            let mut rect = RECT::default();
-            let _ = windows::Win32::UI::WindowsAndMessaging::GetWindowRect(hwnd, &mut rect);
-            let width = rect.right - rect.left;
-            let height = rect.bottom - rect.top;
-
-            (width as u64, height as u64)
-        },
+        Target::Window(window) => {
+            let win = Window::from_raw_hwnd(window.raw_handle as *mut _);
+            // `windows-capture` Window exposes width/height via the inner
+            // monitor geometry; fall back to 0 when unreadable.
+            (win.width().unwrap_or(0) as u64, win.height().unwrap_or(0) as u64)
+        }
         Target::Display(display) => {
-            let monitor = Monitor::from_raw_hmonitor(display.raw_handle.0);
+            let monitor = Monitor::from_raw_hmonitor(display.raw_handle as *mut _);
 
             (
                 monitor.width().unwrap() as u64,

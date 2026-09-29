@@ -15,8 +15,10 @@ pub struct Window {
     pub id: u32,
     pub title: String,
 
+    /// Raw HWND as `isize` — no `windows` crate needed. Converted at the
+    /// single use site (`engine::win`) via `from_raw_hwnd`.
     #[cfg(target_os = "windows")]
-    pub raw_handle: windows::Win32::Foundation::HWND,
+    pub raw_handle: isize,
 
     #[cfg(target_os = "macos")]
     pub raw_handle: cidre::cg::WindowId,
@@ -30,8 +32,10 @@ pub struct Display {
     pub id: u32,
     pub title: String,
 
+    /// Raw HMONITOR as `isize` — no `windows` crate needed. Converted at the
+    /// single use site (`engine::win`) via `from_raw_hmonitor`.
     #[cfg(target_os = "windows")]
-    pub raw_handle: windows::Win32::Graphics::Gdi::HMONITOR,
+    pub raw_handle: isize,
 
     #[cfg(target_os = "macos")]
     pub raw_handle: cidre::cg::DirectDisplayId,
