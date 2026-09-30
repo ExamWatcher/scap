@@ -1,6 +1,4 @@
-use std::sync::mpsc;
-
-use super::{CapturerBuildError, Options};
+use super::{CapturerBuildError, FrameSender, Options};
 use crate::frame::Frame;
 
 #[cfg(target_os = "macos")]
@@ -59,10 +57,7 @@ pub struct Engine {
 }
 
 impl Engine {
-    pub fn new(
-        options: &Options,
-        tx: mpsc::Sender<ChannelItem>,
-    ) -> Result<Engine, CapturerBuildError> {
+    pub fn new(options: &Options, tx: FrameSender) -> Result<Engine, CapturerBuildError> {
         #[cfg(target_os = "macos")]
         {
             let error_flag = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));

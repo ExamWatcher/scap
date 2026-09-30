@@ -1,5 +1,4 @@
 use std::sync::atomic::AtomicBool;
-use std::sync::mpsc;
 use std::{cmp, sync::Arc};
 
 use cidre::mach;
@@ -13,12 +12,10 @@ use futures::executor::block_on;
 use crate::frame::{AudioFormat, AudioFrame, Frame, FrameType, VideoFrame};
 use crate::targets::Target;
 use crate::{
-    capturer::{Area, Options, Point, Resolution, Size},
+    capturer::{Area, FrameSender, Options, Point, Resolution, Size},
     frame::BGRAFrame,
     targets,
 };
-
-use super::ChannelItem;
 
 pub(crate) mod ext;
 mod pixel_buffer;
@@ -53,7 +50,7 @@ impl sc::stream::DelegateImpl for ErrorHandler {
 
 #[repr(C)]
 pub struct CapturerInner {
-    pub tx: mpsc::Sender<ChannelItem>,
+    pub tx: FrameSender,
 }
 
 define_obj_type!(pub Capturer + StreamOutputImpl, CapturerInner, CAPTURER);
@@ -69,7 +66,10 @@ impl sc::stream::OutputImpl for Capturer {
         sample_buf: &mut cm::SampleBuf,
         kind: sc::OutputType,
     ) {
-        let _ = self.inner_mut().tx.send((sample_buf.retained(), kind));
+        // Bounded queue: drop the newest sample when a slow consumer is
+        // behind (prevents unbounded memory growth / OOM). `try_send`
+        // never blocks the ScreenCaptureKit dispatch queue.
+        let _ = self.inner_mut().tx.try_send((sample_buf.retained(), kind));
     }
 }
 
@@ -88,7 +88,7 @@ pub(crate) enum CreateCapturerError {
 
 pub(crate) fn create_capturer(
     options: &Options,
-    tx: mpsc::Sender<ChannelItem>,
+    tx: FrameSender,
     error_flag: Arc<AtomicBool>,
 ) -> Result<StreamParts, CreateCapturerError> {
     // If no target is specified, capture the main display
@@ -178,12 +178,17 @@ pub(crate) fn create_capturer(
     stream_config.set_src_rect(source_rect);
     stream_config.set_pixel_format(pixel_format);
     stream_config.set_shows_cursor(options.show_cursor);
-    stream_config.set_minimum_frame_interval(cm::Time {
-        value: 1,
-        scale: options.fps as i32,
-        epoch: 0,
-        flags: cm::TimeFlags::VALID,
-    });
+    // Windows path guards `fps == 0` (means "OS default"); do the same here.
+    // `Options::default()` is fps:0, and a minimum-interval of 1/0 would be
+    // invalid — leave the system default in that case.
+    if options.fps >= 1 {
+        stream_config.set_minimum_frame_interval(cm::Time {
+            value: 1,
+            scale: options.fps as i32,
+            epoch: 0,
+            flags: cm::TimeFlags::VALID,
+        });
+    }
     stream_config.set_captures_audio(options.captures_audio);
 
     let error_handler = ErrorHandler::with(ErrorHandlerInner { error_flag });

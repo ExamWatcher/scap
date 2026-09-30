@@ -30,7 +30,7 @@ use pw::{
 };
 
 use crate::{
-    capturer::Options,
+    capturer::{FrameSender, Options},
     frame::{BGRxFrame, Frame, RGBFrame, RGBxFrame, VideoFrame, XBGRFrame},
 };
 
@@ -44,7 +44,7 @@ static STREAM_STATE_CHANGED_TO_ERROR: AtomicBool = AtomicBool::new(false);
 
 #[derive(Clone)]
 struct ListenerUserData {
-    pub tx: mpsc::Sender<Frame>,
+    pub tx: FrameSender,
     pub format: spa::param::video::VideoInfoRaw,
 }
 
@@ -143,34 +143,40 @@ fn process_callback(stream: &Stream, user_data: &mut ListenerUserData) {
             let _ = timestamp; // suppress "unused" warning until we wire pts elsewhere
             let display_time = SystemTime::now();
 
-            if let Err(e) = match user_data.format.format() {
-                VideoFormat::RGBx => user_data.tx.send(Frame::Video(VideoFrame::RGBx(RGBxFrame {
+            // Bounded queue: `try_send` + drop-on-full so a slow consumer
+            // can never OOM. PipeWire's `VideoMaxFramerate` is advisory and
+            // the compositor may ignore it, so this drop is the real guard.
+            // `Full` is silent (expected when behind); `Disconnected` is
+            // logged like the old send error was.
+            let frame = match user_data.format.format() {
+                VideoFormat::RGBx => Frame::Video(VideoFrame::RGBx(RGBxFrame {
                     display_time,
                     width: frame_size.width as i32,
                     height: frame_size.height as i32,
                     data: frame_data,
-                }))),
-                VideoFormat::RGB => user_data.tx.send(Frame::Video(VideoFrame::RGB(RGBFrame {
+                })),
+                VideoFormat::RGB => Frame::Video(VideoFrame::RGB(RGBFrame {
                     display_time,
                     width: frame_size.width as i32,
                     height: frame_size.height as i32,
                     data: frame_data,
-                }))),
-                VideoFormat::xBGR => user_data.tx.send(Frame::Video(VideoFrame::XBGR(XBGRFrame {
+                })),
+                VideoFormat::xBGR => Frame::Video(VideoFrame::XBGR(XBGRFrame {
                     display_time,
                     width: frame_size.width as i32,
                     height: frame_size.height as i32,
                     data: frame_data,
-                }))),
-                VideoFormat::BGRx => user_data.tx.send(Frame::Video(VideoFrame::BGRx(BGRxFrame {
+                })),
+                VideoFormat::BGRx => Frame::Video(VideoFrame::BGRx(BGRxFrame {
                     display_time,
                     width: frame_size.width as i32,
                     height: frame_size.height as i32,
                     data: frame_data,
-                }))),
+                })),
                 _ => panic!("Unsupported frame format received"),
-            } {
-                eprintln!("{e}");
+            };
+            if let Err(mpsc::TrySendError::Disconnected(_)) = user_data.tx.try_send(frame) {
+                eprintln!("frame receiver disconnected");
             }
         }
     } else {
@@ -183,7 +189,7 @@ fn process_callback(stream: &Stream, user_data: &mut ListenerUserData) {
 // TODO: Format negotiation
 fn pipewire_capturer(
     options: Options,
-    tx: mpsc::Sender<Frame>,
+    tx: FrameSender,
     ready_sender: &SyncSender<bool>,
     stream_id: u32,
 ) -> Result<(), LinCapError> {
@@ -253,7 +259,9 @@ fn pipewire_capturer(
             FormatProperties::VideoMaxFramerate,
             Fraction,
             pw::spa::utils::Fraction {
-                num: options.fps,
+                // fps == 0 means "OS default" (matches win/mac guards);
+                // never advertise 0/1 to the compositor.
+                num: options.fps.max(1),
                 denom: 1
             }
         ),
@@ -325,7 +333,7 @@ pub struct LinuxCapturer {
 
 impl LinuxCapturer {
     // TODO: Error handling
-    pub fn new(options: &Options, tx: mpsc::Sender<Frame>) -> Self {
+    pub fn new(options: &Options, tx: FrameSender) -> Self {
         let connection =
             dbus::blocking::Connection::new_session().expect("Failed to create dbus connection");
         let stream_id = ScreenCastPortal::new(&connection)
@@ -372,6 +380,6 @@ impl LinuxCapturer {
     }
 }
 
-pub fn create_capturer(options: &Options, tx: mpsc::Sender<Frame>) -> LinuxCapturer {
+pub fn create_capturer(options: &Options, tx: FrameSender) -> LinuxCapturer {
     LinuxCapturer::new(options, tx)
 }

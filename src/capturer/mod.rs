@@ -12,6 +12,16 @@ use crate::{
 
 pub use engine::get_output_frame_size;
 
+/// Bound on queued frames between the OS capture thread and the consumer.
+///
+/// All engines push into this queue; a slow consumer (e.g. 1 screenshot/sec
+/// against a 60fps producer) used to grow it without limit -> OOM. With a
+/// bounded queue the producers use non-blocking `try_send` and drop the
+/// newest frame when full, so memory stays at `CAP x frame size` worst case
+/// (1080p BGRA ~8.3MB -> ~33MB) on every OS. A keeping-up consumer never
+/// sees a drop.
+pub(crate) const FRAME_QUEUE_CAP: usize = 4;
+
 #[derive(Debug, Clone, Copy, Default)]
 pub enum Resolution {
     _480p,
@@ -81,6 +91,11 @@ pub struct Capturer {
     rx: mpsc::Receiver<ChannelItem>,
 }
 
+/// Sender half of the frame queue. Bounded (see `FRAME_QUEUE_CAP`): producers
+/// must use non-blocking `try_send` and drop on `Full` so a slow consumer
+/// can never OOM the process, on any OS.
+pub(crate) type FrameSender = mpsc::SyncSender<ChannelItem>;
+
 #[derive(Debug)]
 pub enum CapturerBuildError {
     NotSupported,
@@ -117,7 +132,7 @@ impl Capturer {
             return Err(CapturerBuildError::NotSupported);
         }
 
-        let (tx, rx) = mpsc::channel();
+        let (tx, rx) = mpsc::sync_channel(FRAME_QUEUE_CAP);
         let engine = engine::Engine::new(&options, tx)?;
 
         Ok(Capturer { engine, rx })
@@ -152,6 +167,8 @@ impl Capturer {
     /// Non-blocking drain step: returns the next queued video frame if one is
     /// ready, `Ok(None)` when the queue is empty, and `Err(RecvError)` when the
     /// producer has disconnected (same disconnect semantics as `get_next_frame`).
+    ///
+    /// Cross-platform: works on Windows, macOS and Linux.
     pub fn try_next_frame(&self) -> Result<Option<Frame>, mpsc::RecvError> {
         loop {
             match self.rx.try_recv() {
@@ -162,6 +179,23 @@ impl Capturer {
                 }
                 Err(mpsc::TryRecvError::Empty) => return Ok(None),
                 Err(mpsc::TryRecvError::Disconnected) => return Err(mpsc::RecvError),
+            }
+        }
+    }
+
+    /// Latest-frame grab for slow consumers (e.g. screenshot timers).
+    ///
+    /// Drains the whole queue and returns the newest video frame, dropping
+    /// stale ones — memory stays flat no matter how slow you poll. Skips
+    /// audio frames (call `try_next_frame` directly if you need audio).
+    /// Returns `Ok(None)` when no video frame is queued.
+    pub fn try_latest_video_frame(&self) -> Result<Option<Frame>, mpsc::RecvError> {
+        let mut latest: Option<Frame> = None;
+        loop {
+            match self.try_next_frame()? {
+                Some(frame @ Frame::Video(_)) => latest = Some(frame),
+                Some(_) => continue, // skip audio, keep draining
+                None => return Ok(latest),
             }
         }
     }

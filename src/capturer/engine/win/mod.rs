@@ -1,11 +1,11 @@
 use crate::{
-    capturer::{Area, Options, Point, Resolution, Size},
+    capturer::{Area, FrameSender, Options, Point, Resolution, Size},
     frame::{AudioFormat, AudioFrame, BGRAFrame, Frame, FrameType, VideoFrame},
     targets::{self, Target},
 };
-use std::time::Instant;
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
+use std::time::Instant;
 use std::time::{SystemTime, UNIX_EPOCH};
 use std::{cmp, time::Duration};
 use windows_capture::{
@@ -22,7 +22,7 @@ use windows_capture::{
 
 #[derive(Debug)]
 struct Capturer {
-    pub tx: mpsc::Sender<Frame>,
+    pub tx: FrameSender,
     pub crop: Option<Area>,
     pub start_time: (Instant, SystemTime),
 }
@@ -93,7 +93,9 @@ impl GraphicsCaptureApiHandler for Capturer {
                     data: raw_frame_buffer.to_vec(),
                 };
 
-                let _ = self.tx.send(Frame::Video(VideoFrame::BGRA(bgr_frame)));
+                // Bounded queue: drop the newest frame when a slow consumer
+                // is behind (prevents unbounded memory growth / OOM).
+                let _ = self.tx.try_send(Frame::Video(VideoFrame::BGRA(bgr_frame)));
             }
             None => {
                 // NOTE: `FrameBuffer` borrows `frame`, so cache dimensions first.
@@ -114,7 +116,9 @@ impl GraphicsCaptureApiHandler for Capturer {
                     data: frame_data,
                 };
 
-                let _ = self.tx.send(Frame::Video(VideoFrame::BGRA(bgr_frame)));
+                // Bounded queue: drop the newest frame when a slow consumer
+                // is behind (prevents unbounded memory growth / OOM).
+                let _ = self.tx.try_send(Frame::Video(VideoFrame::BGRA(bgr_frame)));
             }
         }
         Ok(())
@@ -152,7 +156,7 @@ impl WCStream {
 
 #[derive(Clone, Debug)]
 struct FlagStruct {
-    pub tx: mpsc::Sender<Frame>,
+    pub tx: FrameSender,
     pub crop: Option<Area>,
 }
 
@@ -174,7 +178,7 @@ fn minimum_update_interval(fps: u32) -> MinimumUpdateIntervalSettings {
 
 pub fn create_capturer(
     options: &Options,
-    tx: mpsc::Sender<Frame>,
+    tx: FrameSender,
 ) -> Result<WCStream, CreateCapturerError> {
     let target = options
         .target
@@ -370,7 +374,7 @@ fn build_audio_stream(
 }
 
 fn spawn_audio_stream(
-    tx: Sender<Frame>,
+    tx: FrameSender,
     ready_tx: Sender<Result<(), CreateCapturerError>>,
     ctrl_rx: Receiver<AudioStreamControl>,
 ) {
@@ -436,8 +440,11 @@ fn spawn_audio_stream(
                 timestamp,
             );
 
-            if let Err(_) = tx.send(Frame::Audio(frame)) {
-                return;
+            // Bounded queue: drop audio when a slow consumer is behind;
+            // stop only when the receiver is gone.
+            match tx.try_send(Frame::Audio(frame)) {
+                Err(mpsc::TrySendError::Disconnected(_)) => return,
+                _ => {}
             };
         }
     });
