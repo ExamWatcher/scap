@@ -31,7 +31,10 @@ use pw::{
 
 use crate::{
     capturer::{FrameSender, Options},
-    frame::{BGRxFrame, Frame, RGBFrame, RGBxFrame, VideoFrame, XBGRFrame},
+    frame::{
+        BGRAFrame, Frame, VideoFrame, convert_bgrx_to_bgra, convert_rgb_to_bgra,
+        convert_rgbx_to_bgra, convert_xbgr_to_bgra,
+    },
 };
 
 use self::{error::LinCapError, portal::ScreenCastPortal};
@@ -143,38 +146,37 @@ fn process_callback(stream: &Stream, user_data: &mut ListenerUserData) {
             let _ = timestamp; // suppress "unused" warning until we wire pts elsewhere
             let display_time = SystemTime::now();
 
+            // Normalise to BGRA: the negotiated PipeWire layout varies by compositor
+            // while consumers ask for one (`output_type: BGRAFrame`). A format outside
+            // the negotiated set, or bytes that do not match the dimensions (strided
+            // rows), drops the frame — never a panic on the PipeWire thread, and the
+            // buffer is still re-queued below via `break 'outside`.
+            let bgra = match user_data.format.format() {
+                VideoFormat::RGBx => convert_rgbx_to_bgra(frame_data),
+                VideoFormat::RGB => convert_rgb_to_bgra(frame_data),
+                VideoFormat::xBGR => convert_xbgr_to_bgra(frame_data),
+                VideoFormat::BGRx => convert_bgrx_to_bgra(frame_data),
+                other => {
+                    eprintln!("unsupported pipewire frame format ({other:?}); dropping frame");
+                    break 'outside;
+                }
+            };
+            let (width, height) = (frame_size.width as usize, frame_size.height as usize);
+            if bgra.len() != width * height * 4 {
+                eprintln!("frame bytes do not match dimensions; dropping frame");
+                break 'outside;
+            }
+            let frame = Frame::Video(VideoFrame::BGRA(BGRAFrame {
+                display_time,
+                width: width as i32,
+                height: height as i32,
+                data: bgra,
+            }));
             // Bounded queue: `try_send` + drop-on-full so a slow consumer
             // can never OOM. PipeWire's `VideoMaxFramerate` is advisory and
             // the compositor may ignore it, so this drop is the real guard.
             // `Full` is silent (expected when behind); `Disconnected` is
             // logged like the old send error was.
-            let frame = match user_data.format.format() {
-                VideoFormat::RGBx => Frame::Video(VideoFrame::RGBx(RGBxFrame {
-                    display_time,
-                    width: frame_size.width as i32,
-                    height: frame_size.height as i32,
-                    data: frame_data,
-                })),
-                VideoFormat::RGB => Frame::Video(VideoFrame::RGB(RGBFrame {
-                    display_time,
-                    width: frame_size.width as i32,
-                    height: frame_size.height as i32,
-                    data: frame_data,
-                })),
-                VideoFormat::xBGR => Frame::Video(VideoFrame::XBGR(XBGRFrame {
-                    display_time,
-                    width: frame_size.width as i32,
-                    height: frame_size.height as i32,
-                    data: frame_data,
-                })),
-                VideoFormat::BGRx => Frame::Video(VideoFrame::BGRx(BGRxFrame {
-                    display_time,
-                    width: frame_size.width as i32,
-                    height: frame_size.height as i32,
-                    data: frame_data,
-                })),
-                _ => panic!("Unsupported frame format received"),
-            };
             if let Err(mpsc::TrySendError::Disconnected(_)) = user_data.tx.try_send(frame) {
                 eprintln!("frame receiver disconnected");
             }
@@ -332,15 +334,24 @@ pub struct LinuxCapturer {
 }
 
 impl LinuxCapturer {
-    // TODO: Error handling
-    pub fn new(options: &Options, tx: FrameSender) -> Self {
-        let connection =
-            dbus::blocking::Connection::new_session().expect("Failed to create dbus connection");
+    /// Open the portal ScreenCast session and start the PipeWire thread.
+    ///
+    /// Blocking: `create_stream` shows the system's screen picker and waits for the
+    /// user (the portal answers cancel as an error, after its own timeout if ignored).
+    /// Every failure — no D-Bus session, unsupported cursor mode, a denied or
+    /// cancelled picker, a dead setup thread — is an `Err`, never a panic, so the
+    /// caller decides whether and when to re-prompt. Call on a thread that may block;
+    /// at most one capturer runs per process (the portal session below is global).
+    pub fn new(options: &Options, tx: FrameSender) -> Result<Self, LinCapError> {
+        let connection = dbus::blocking::Connection::new_session().map_err(|error| {
+            LinCapError::new(format!("could not open a D-Bus session: {error}"))
+        })?;
         let stream_id = ScreenCastPortal::new(&connection)
-            .show_cursor(options.show_cursor)
-            .expect("Unsupported cursor mode")
+            .show_cursor(options.show_cursor)?
             .create_stream()
-            .expect("Failed to get screencast stream")
+            .map_err(|error| {
+                LinCapError::new(format!("screen-cast session failed (denied or cancelled?): {error}"))
+            })?
             .pw_node_id();
 
         // TODO: Fix this hack
@@ -354,14 +365,19 @@ impl LinuxCapturer {
             res
         });
 
-        if !ready_recv.recv().expect("Failed to receive") {
-            panic!("Failed to setup capturer");
+        let ready = ready_recv.recv().map_err(|_| {
+            LinCapError::new("capturer thread died during setup".to_owned())
+        })?;
+        if !ready {
+            return Err(LinCapError::new(
+                "pipewire thread reported setup failure".to_owned(),
+            ));
         }
 
-        Self {
+        Ok(Self {
             capturer_join_handle: Some(capturer_join_handle),
             _connection: connection,
-        }
+        })
     }
 
     pub fn start_capture(&self) {
@@ -380,6 +396,9 @@ impl LinuxCapturer {
     }
 }
 
-pub fn create_capturer(options: &Options, tx: FrameSender) -> LinuxCapturer {
+pub fn create_capturer(
+    options: &Options,
+    tx: FrameSender,
+) -> Result<LinuxCapturer, LinCapError> {
     LinuxCapturer::new(options, tx)
 }

@@ -82,7 +82,10 @@ impl Engine {
 
         #[cfg(target_os = "linux")]
         {
-            let linux = linux::create_capturer(options, tx);
+            // Portal denial/cancel surfaces here as an Engine error (never a panic),
+            // so `Capturer::build` reports it and the caller decides when to re-prompt.
+            let linux = linux::create_capturer(options, tx)
+                .map_err(|error| CapturerBuildError::Engine(error.to_string()))?;
             Ok(Engine {
                 linux,
                 options: (*options).clone(),

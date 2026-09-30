@@ -121,6 +121,59 @@ pub fn convert_bgra_to_rgb(frame_data: Vec<u8>) -> Vec<u8> {
     data
 }
 
+/// Convert tightly-packed RGBx bytes to opaque BGRA.
+///
+/// PipeWire negotiates whatever the compositor prefers (KDE serves RGBx/BGRx,
+/// others RGB/XBGR) while consumers ask for one layout. These four converters
+/// normalise to BGRA at the engine boundary, so downstream code never branches
+/// on the compositor. Alpha is always opaque: screen pixels have no translucency.
+pub fn convert_rgbx_to_bgra(frame_data: Vec<u8>) -> Vec<u8> {
+    let mut data: Vec<u8> = Vec::with_capacity(frame_data.len());
+    for src in frame_data.chunks_exact(4) {
+        data.push(src[2]);
+        data.push(src[1]);
+        data.push(src[0]);
+        data.push(255);
+    }
+    data
+}
+
+/// Convert tightly-packed RGB bytes to opaque BGRA.
+pub fn convert_rgb_to_bgra(frame_data: Vec<u8>) -> Vec<u8> {
+    let mut data: Vec<u8> = Vec::with_capacity(frame_data.len() / 3 * 4);
+    for src in frame_data.chunks_exact(3) {
+        data.push(src[2]);
+        data.push(src[1]);
+        data.push(src[0]);
+        data.push(255);
+    }
+    data
+}
+
+/// Convert tightly-packed XBGR bytes to opaque BGRA.
+pub fn convert_xbgr_to_bgra(frame_data: Vec<u8>) -> Vec<u8> {
+    let mut data: Vec<u8> = Vec::with_capacity(frame_data.len());
+    for src in frame_data.chunks_exact(4) {
+        data.push(src[1]);
+        data.push(src[2]);
+        data.push(src[3]);
+        data.push(255);
+    }
+    data
+}
+
+/// Convert tightly-packed BGRx bytes to opaque BGRA.
+pub fn convert_bgrx_to_bgra(frame_data: Vec<u8>) -> Vec<u8> {
+    let mut data: Vec<u8> = Vec::with_capacity(frame_data.len());
+    for src in frame_data.chunks_exact(4) {
+        data.push(src[0]);
+        data.push(src[1]);
+        data.push(src[2]);
+        data.push(255);
+    }
+    data
+}
+
 pub fn get_cropped_data(data: Vec<u8>, cur_width: i32, height: i32, width: i32) -> Vec<u8> {
     if data.len() as i32 != height * cur_width * 4 {
         data
@@ -165,6 +218,17 @@ mod tests {
         ($n:expr) => {
             &mut vec![$n, $n, $n, $n]
         };
+    }
+
+    #[test]
+    fn a_pixel_survives_every_linux_layout_to_bgra() {
+        // One red pixel (R=10, G=20, B=30) through each layout the compositor
+        // may negotiate: BGRA must come out [30, 20, 10, 255] every time.
+        let expected = vec![30, 20, 10, 255];
+        assert_eq!(convert_rgbx_to_bgra(vec![10, 20, 30, 0]), expected);
+        assert_eq!(convert_rgb_to_bgra(vec![10, 20, 30]), expected);
+        assert_eq!(convert_xbgr_to_bgra(vec![0, 30, 20, 10]), expected);
+        assert_eq!(convert_bgrx_to_bgra(vec![30, 20, 10, 0]), expected);
     }
 
     #[test]
