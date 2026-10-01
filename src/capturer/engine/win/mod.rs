@@ -101,9 +101,28 @@ impl GraphicsCaptureApiHandler for Capturer {
                     .buffer_crop(start_x, start_y, end_x, end_y)
                     .expect("Failed to crop buffer");
 
-                // get raw frame buffer
+                // get raw frame buffer, avoiding a second full-frame copy when
+                // the mapped rows carry padding: `as_nopadding_buffer` depads
+                // exactly `w*h*4` bytes into the scratch Vec, so move that
+                // Vec into the frame instead of `to_vec()`-ing it again
+                // (one transient full-frame alloc+memcpy saved per delivered
+                // frame). Without padding it borrows the mapped texture, so
+                // that case still copies out with `to_vec()`.
                 let mut nopadding_buf = Vec::new();
-                let raw_frame_buffer = cropped_buffer.as_nopadding_buffer(&mut nopadding_buf);
+                let frame_data = if cropped_buffer.has_padding() {
+                    // The return value just reborrows the scratch Vec, so
+                    // discard it and move the Vec into the frame.
+                    let _ = cropped_buffer.as_nopadding_buffer(&mut nopadding_buf);
+                    debug_assert_eq!(
+                        nopadding_buf.len(),
+                        (end_x - start_x) as usize * (end_y - start_y) as usize * 4
+                    );
+                    nopadding_buf
+                } else {
+                    cropped_buffer
+                        .as_nopadding_buffer(&mut nopadding_buf)
+                        .to_vec()
+                };
 
                 let _current_time = SystemTime::now()
                     .duration_since(UNIX_EPOCH)
@@ -114,7 +133,7 @@ impl GraphicsCaptureApiHandler for Capturer {
                     display_time,
                     width: cropped_area.size.width as i32,
                     height: cropped_area.size.height as i32,
-                    data: raw_frame_buffer.to_vec(),
+                    data: frame_data,
                 };
 
                 // Bounded queue: drop the newest frame when a slow consumer
