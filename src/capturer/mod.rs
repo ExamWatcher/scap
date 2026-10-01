@@ -18,9 +18,12 @@ pub use engine::get_output_frame_size;
 /// against a 60fps producer) used to grow it without limit -> OOM. With a
 /// bounded queue the producers use non-blocking `try_send` and drop the
 /// newest frame when full, so memory stays at `CAP x frame size` worst case
-/// (1080p BGRA ~8.3MB -> ~33MB) on every OS. A keeping-up consumer never
-/// sees a drop.
-pub(crate) const FRAME_QUEUE_CAP: usize = 4;
+/// (1080p BGRA ~8.3MB -> ~17MB) on every OS. A keeping-up consumer never
+/// sees a drop: one slot covers the producer-consumer phase offset, the
+/// second absorbs a single late take. Down from 4: the Windows engine paces
+/// itself to `Options.fps`, so slots three and four only ever held frames a
+/// 1 Hz consumer had already decided not to look at.
+pub(crate) const FRAME_QUEUE_CAP: usize = 2;
 
 #[derive(Debug, Clone, Copy, Default)]
 pub enum Resolution {
