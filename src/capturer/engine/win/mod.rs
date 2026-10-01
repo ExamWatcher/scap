@@ -25,6 +25,16 @@ struct Capturer {
     pub tx: FrameSender,
     pub crop: Option<Area>,
     pub start_time: (Instant, SystemTime),
+    /// Minimum time between two queued frames, from `Options.fps`.
+    ///
+    /// Windows Graphics Capture does not honor `MinimumUpdateInterval`
+    /// strictly: on an active screen it delivers far faster than the
+    /// requested 1 fps, and every delivery allocates a full frame that is
+    /// then dropped on the full queue. Gating here bounds production to what
+    /// a 1 Hz consumer can ever take, before any allocation happens.
+    pub min_interval: Duration,
+    /// When the last frame was accepted for the queue (`None` before the first).
+    pub last_sent: Option<Instant>,
 }
 
 #[derive(Clone)]
@@ -48,6 +58,8 @@ impl GraphicsCaptureApiHandler for Capturer {
             tx: context.flags.tx,
             crop: context.flags.crop,
             start_time: (Instant::now(), SystemTime::now()),
+            min_interval: context.flags.min_interval,
+            last_sent: None,
         })
     }
 
@@ -56,8 +68,20 @@ impl GraphicsCaptureApiHandler for Capturer {
         frame: &mut WCFrame,
         _: InternalCaptureControl,
     ) -> Result<(), Self::Error> {
-        // Wall-clock display time from the steady clock: elapsed since
-        // session start, no QPC needed (`windows` crate gone).
+        // Producer-side fps gate: drop frames arriving sooner than the
+        // requested interval *before* allocating or converting anything. The
+        // OS delivers on content change regardless of `MinimumUpdateInterval`,
+        // so without this every delivery pays a full-frame allocation that the
+        // bounded queue then discards. The first frame always passes.
+        let now = Instant::now();
+        let too_soon = match self.last_sent {
+            Some(last_sent) => now.duration_since(last_sent) < self.min_interval,
+            None => false,
+        };
+        if too_soon {
+            return Ok(());
+        }
+        self.last_sent = Some(now);
         let display_time = self
             .start_time
             .1
@@ -158,6 +182,8 @@ impl WCStream {
 struct FlagStruct {
     pub tx: FrameSender,
     pub crop: Option<Area>,
+    /// Producer-side pacing, from `Options.fps` (see `Capturer::min_interval`).
+    pub min_interval: Duration,
 }
 
 #[derive(Debug)]
@@ -205,6 +231,15 @@ pub fn create_capturer(
     };
 
     let minimum_update_interval = minimum_update_interval(options.fps);
+    // The OS-side hint above is best-effort (Windows delivers on content
+    // change regardless), so the handler enforces the same rate itself —
+    // see `Capturer::min_interval`. `fps == 0` means unthrottled, preserving
+    // the old behaviour for callers that drain as fast as they can.
+    let min_interval = if options.fps >= 1 {
+        Duration::from_secs_f32(1.0 / options.fps as f32)
+    } else {
+        Duration::ZERO
+    };
 
     let settings = match target {
         Target::Display(display) => Settings::Display(WCSettings::new(
@@ -218,6 +253,7 @@ pub fn create_capturer(
             FlagStruct {
                 tx: tx.clone(),
                 crop: Some(get_crop_area(options)),
+                min_interval,
             },
         )),
         Target::Window(window) => Settings::Window(WCSettings::new(
@@ -231,6 +267,7 @@ pub fn create_capturer(
             FlagStruct {
                 tx: tx.clone(),
                 crop: Some(get_crop_area(options)),
+                min_interval,
             },
         )),
     };
